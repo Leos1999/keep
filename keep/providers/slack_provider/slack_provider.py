@@ -74,6 +74,8 @@ class SlackProvider(BaseProvider):
             name="get_messages",
             description="Get messages from a Slack channel",
             type="view",
+            func_name="get_messages",
+            scopes=["channels:history", "channels:read"],
             params={
                 "channel": "str",
                 "oldest": "int",
