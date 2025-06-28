@@ -10,11 +10,13 @@ from typing import OrderedDict
 import pydantic
 import requests
 
+from keep.api.models.alert import AlertDto, AlertSeverity, AlertStatus
 from keep.contextmanager.contextmanager import ContextManager
 from keep.exceptions.provider_exception import ProviderException
 from keep.functions import utcnowtimestamp
 from keep.providers.base.base_provider import BaseProvider
-from keep.providers.models.provider_config import ProviderConfig
+from keep.providers.models.provider_config import ProviderConfig, ProviderScope
+from keep.providers.models.provider_method import ProviderMethod
 
 
 @pydantic.dataclasses.dataclass
@@ -50,10 +52,42 @@ class SlackProvider(BaseProvider):
     SLACK_API = "https://slack.com/api"
     PROVIDER_CATEGORY = ["Collaboration"]
 
+    # Update PROVIDER_SCOPES to include required permissions
+    PROVIDER_SCOPES = [
+        ProviderScope(
+            name="channels:read",
+            description="Required to list available channels",
+            mandatory=True,
+            documentation_url="https://api.slack.com/scopes/channels:read", 
+        ),
+        ProviderScope(
+            name="channels:history",
+            description="Required to read messages from channels",
+            mandatory=True,
+            documentation_url="https://api.slack.com/scopes/channels:history",
+        )
+    ]
+
+    # Add provider method configuration
+    PROVIDER_METHODS = [
+        ProviderMethod(
+            name="get_messages",
+            description="Get messages from a Slack channel",
+            type="view",
+            params={
+                "channel": "str",
+                "oldest": "int",
+                "limit": "int"
+            }
+        )
+    ]
+
     def __init__(
         self, context_manager: ContextManager, provider_id: str, config: ProviderConfig
     ):
         super().__init__(context_manager, provider_id, config)
+        # Track latest message timestamp per channel
+        self.last_message_ts = {}
 
     def validate_config(self):
         self.authentication_config = SlackProviderAuthConfig(
@@ -284,6 +318,108 @@ class SlackProvider(BaseProvider):
             notify_data = {"slack_timestamp": response_json["ts"]}
         self.logger.info("Message notified to Slack")
         return notify_data
+
+    def _get_alerts(self) -> list[AlertDto]:
+        """
+        Get new alerts from configured Slack channels since last check.
+        Only returns messages that arrived after the previous call.
+        """
+        if not self.authentication_config.access_token:
+            raise ProviderException("Access token is required to get messages from channels")
+
+        alerts = []
+        channels = self.config.get("channels", [])
+
+        for channel in channels:
+            # Get messages since last check
+            oldest = self.last_message_ts.get(channel)
+            messages = self._get_messages(
+                channel=channel,
+                oldest=oldest,
+                limit=1  # Adjust limit as needed
+            )
+
+            if not messages:
+                continue
+
+            # Update latest message timestamp for this channel
+            latest_msg = messages[0]  # Messages are returned in reverse chronological order
+            self.last_message_ts[channel] = latest_msg["ts"]
+
+            # Convert messages to alerts
+            for msg in messages:
+                # Skip messages we've already seen
+                if oldest and float(msg["ts"]) <= float(oldest):
+                    continue
+                    
+                alert = AlertDto(
+                    id=msg["ts"],
+                    name=f"Slack Message from {channel}",
+                    description=msg.get("text", ""),
+                    message=msg.get("text", ""),
+                    lastReceived=msg["ts"],
+                    source=["slack"],
+                    url=msg.get("permalink"),
+                    severity=AlertSeverity.INFO,
+                    status=AlertStatus.FIRING,
+                    channel=channel,
+                    user=msg.get("user", ""),
+                    thread_ts=msg.get("thread_ts", "")
+                )
+                alerts.append(alert)
+
+        return alerts
+
+    def _get_messages(self, channel: str, oldest: int = None, limit: int = 100):
+        """Get messages from a Slack channel.
+
+        Args:
+            channel: Channel ID or name
+            oldest: Start of time range in epoch seconds
+            limit: Maximum number of messages to return
+        """
+        params = {
+            "channel": channel,
+            "limit": limit
+        }
+        if oldest:
+            params["oldest"] = oldest
+
+        response = requests.get(
+            f"{self.SLACK_API}/conversations.history",
+            headers={
+                "Authorization": f"Bearer {self.authentication_config.access_token}"
+            },
+            params=params
+        )
+
+        if not response.ok:
+            raise ProviderException(f"Failed to get messages: {response.text}")
+
+        data = response.json()
+        if not data.get("ok"):
+            raise ProviderException(f"Slack API error: {data.get('error')}")
+
+        messages = data["messages"]
+
+        # Get permalinks for messages
+        for msg in messages:
+            permalink_response = requests.get(
+                f"{self.SLACK_API}/chat.getPermalink",
+                headers={
+                    "Authorization": f"Bearer {self.authentication_config.access_token}"
+                },
+                params={
+                    "channel": channel,
+                    "message_ts": msg["ts"]
+                }
+            )
+            if permalink_response.ok:
+                permalink_data = permalink_response.json()
+                if permalink_data.get("ok"):
+                    msg["permalink"] = permalink_data["permalink"]
+
+        return messages
 
 
 if __name__ == "__main__":
